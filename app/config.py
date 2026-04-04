@@ -21,5 +21,8 @@ class Settings(BaseModel):
     shop_hours: str = os.getenv("SHOP_HOURS", "Mon-Sat 9:00 AM - 6:00 PM")
     shop_address: str = os.getenv("SHOP_ADDRESS", "Logan, Utah")
 
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+
 
 settings = Settings()
