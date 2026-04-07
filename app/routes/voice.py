@@ -1,42 +1,59 @@
+"""Voice webhook endpoints that collect lead details over multi-turn calls."""
+
 from fastapi import APIRouter, Depends, Form, Response
 from sqlmodel import Session
+from sqlmodel import select
+from app.models import Business
 from app.db import get_session
 from app.schemas import LeadCreate
 from app.services.lead_service import create_lead, mark_booking_link_sent, mark_owner_notified
-from app.services.twilio_service import send_sms
 from app.services.ai_service import analyze_customer_turn
+from app.services.config_service import (
+    get_business_config,
+    get_first_missing_required_field,
+    get_prompt_for_field,
+)
 from app.config import settings
 from twilio.twiml.voice_response import VoiceResponse, Gather
 
 router = APIRouter(prefix="/voice", tags=["voice"])
 
+# In-memory per-caller state for a single process instance.
 CALL_STATE = {}
 
+def normalize_number(num: str):
+    """Normalize phone values so state keys are consistent."""
+    return num.replace("+", "").strip()
 
 def full_url(path: str) -> str:
+    """Build absolute callback URLs Twilio can post back to."""
     return f"{settings.base_url.rstrip('/')}{path}"
 
 
 def gather_response(prompt_text: str, action_path: str) -> str:
+    """Return TwiML that asks for speech and posts the response to action_path."""
     response = VoiceResponse()
     gather = Gather(
         input="speech",
         action=full_url(action_path),
         method="POST",
+        timeout=5,
         speech_timeout="auto",
     )
     gather.say(prompt_text)
     response.append(gather)
-    response.say("Sorry, I did not catch that. Please call back and try again.")
+    response.say("We did not receive your response. Goodbye.")
     response.hangup()
     return str(response)
 
 
 def merge_field(old_value, new_value):
+    """Prefer newly extracted values unless they are empty/placeholder values."""
     return new_value if new_value not in (None, "", "Unknown") else old_value
 
 
 def empty_state():
+    """Default shape for per-call structured extraction state."""
     return {
         "caller_name": None,
         "intent": "booking",
@@ -46,18 +63,48 @@ def empty_state():
         "notes": [],
     }
 
-
 @router.post("/incoming")
-def incoming_call(From: str = Form(default="")):
-    if From:
-        CALL_STATE[From] = empty_state()
+def incoming_call(
+    session: Session = Depends(get_session),
+    From: str = Form(default=""),
+    To: str = Form(default=""),
+):
+    """Handle initial inbound call webhook and start first Gather prompt."""
+    statement = select(Business).where(Business.twilio_number == To)
+    business = session.exec(statement).first()
+
+    print("INCOMING HIT")
+    print("From:", From)
+    print("To:", To)
+    print("BASE_URL:", settings.base_url)
+    print("COLLECT URL:", full_url("/voice/collect"))
+
+    if not business:
+        response = VoiceResponse()
+        response.say("Sorry, this number is not configured.")
+        response.hangup()
+        return Response(content=str(response), media_type="application/xml")
+
+    config = get_business_config(session, business.id)
+
+    normalized_from = normalize_number(From)
+    if normalized_from:
+        # Seed state so each subsequent /collect turn can merge extracted fields.
+        CALL_STATE[normalized_from] = {
+            **empty_state(),
+            "business_id": business.id,
+        }
 
     greeting = (
-        f"Hi, this is {settings.shop_name}. Everyone is with clients right now, but I can help. "
-        "What can I get you today?"
+        config.greeting
+        if config and config.greeting
+        else f"Hi, this is {business.name}. Everyone is with clients right now, but I can help. What can I get you today?"
     )
-    return Response(content=gather_response(greeting, "/voice/collect"), media_type="application/xml")
 
+    return Response(
+        content=gather_response(greeting, "/voice/collect"),
+        media_type="application/xml",
+    )
 
 @router.post("/collect")
 def collect_turn(
@@ -65,12 +112,29 @@ def collect_turn(
     From: str = Form(default=""),
     SpeechResult: str = Form(default=""),
 ):
+    """Handle each spoken customer turn and decide ask-next vs. complete."""
+    print("COLLECT HIT")
+    print("From:", From)
+    print("SpeechResult:", SpeechResult)
+
+    normalized_from = normalize_number(From)
+
+    if normalized_from not in CALL_STATE:
+        print("WARNING: Missing CALL_STATE for", normalized_from)
+        response = VoiceResponse()
+        fallback_message = "Sorry, something went wrong. Please call back."
+        
+        response.say(fallback_message)
+
+        response.hangup()
+        return Response(content=str(response), media_type="application/xml")
+
+    state = CALL_STATE[normalized_from]
+
     result = analyze_customer_turn(SpeechResult)
+    print("RESULT:", result)
 
-    if From not in CALL_STATE:
-        CALL_STATE[From] = empty_state()
-
-    state = CALL_STATE[From]
+    # Merge AI extraction with previously collected state.
     state["caller_name"] = merge_field(state["caller_name"], result.get("caller_name"))
     state["intent"] = merge_field(state["intent"], result.get("intent", "booking"))
     state["service_requested"] = merge_field(state["service_requested"], result.get("service_requested"))
@@ -80,72 +144,99 @@ def collect_turn(
     if SpeechResult:
         state["notes"].append(SpeechResult)
 
-    # only require service + time for MVP
-    missing_service = not state["service_requested"]
-    missing_time = not state["preferred_time"]
+    business_id = state.get("business_id")
+    if not business_id:
+        response = VoiceResponse()
+        response.say("Something went wrong. Please try again later.")
+        response.hangup()
+        return Response(content=str(response), media_type="application/xml")
 
-    if missing_service:
-        return Response(
-            content=gather_response("Got you — what service are you looking for?", "/voice/collect"),
-            media_type="application/xml",
-        )
+    statement = select(Business).where(Business.id == business_id)
+    business = session.exec(statement).first()
+    if not business:
+        response = VoiceResponse()
+        response.say("Sorry, this business could not be found.")
+        response.hangup()
+        return Response(content=str(response), media_type="application/xml")
 
-    if missing_time:
+    config = get_business_config(session, business.id)
+
+    print("STATE:", state)
+    print("BUSINESS:", business)
+
+    missing_field = get_first_missing_required_field(config, state)
+    if missing_field:
+        # Ask only for the next required field to keep conversation focused.
+        prompt = get_prompt_for_field(config, missing_field)
         return Response(
-            content=gather_response("Perfect — what time were you thinking?", "/voice/collect"),
+            content=gather_response(prompt, "/voice/collect"),
             media_type="application/xml",
         )
 
     combined_notes = " | ".join(state["notes"])
 
-    lead = create_lead(
-        session,
-        LeadCreate(
-            phone_number=From,
-            caller_name=state["caller_name"],
-            intent=state["intent"],
-            service_requested=state["service_requested"],
-            preferred_barber=state["preferred_barber"],
-            preferred_time=state["preferred_time"],
-            notes=combined_notes,
-        ),
-    )
+    try:
+        lead = create_lead(
+            session,
+            LeadCreate(
+                business_id=business.id,
+                phone_number=normalized_from,
+                caller_name=state["caller_name"],
+                intent=state["intent"],
+                service_requested=state["service_requested"],
+                preferred_barber=state["preferred_barber"],
+                preferred_time=state["preferred_time"],
+                notes=combined_notes,
+            ),
+        )
+    except Exception as e:
+        print("LEAD CREATION ERROR:", str(e))
+        response = VoiceResponse()
+        response.say("Something went wrong saving your request. Please try again.")
+        response.hangup()
+        return Response(content=str(response), media_type="application/xml")
 
     customer_text = (
         f"Hey {lead.caller_name or ''}! We got your request for a "
         f"{lead.service_requested or 'service'} "
         f"{'at ' + lead.preferred_time if lead.preferred_time else ''}. "
-        f"Book here to lock it in: {settings.shop_booking_link}"
+        f"Book here to lock it in: {business.booking_link}"
     )
 
     owner_text = (
-    f"📞 New missed call lead\n\n"
-    f"👤 {lead.caller_name or 'Unknown'}\n"
-    f"💈 {lead.service_requested or 'Unknown service'}\n"
-    f"⏰ {lead.preferred_time or 'No time given'}\n"
-    f"✂️ {lead.preferred_barber or 'No preference'}\n\n"
-    f"📱 {lead.phone_number}"
+        f"📞 New missed call lead\n\n"
+        f"👤 {lead.caller_name or 'Unknown'}\n"
+        f"💈 {lead.service_requested or 'Unknown service'}\n"
+        f"⏰ {lead.preferred_time or 'No time given'}\n"
+        f"✂️ {lead.preferred_barber or 'No preference'}\n\n"
+        f"📱 {lead.phone_number}"
     )
 
     try:
-        if settings.twilio_phone_number and settings.shop_booking_link:
-            customer_msg = send_sms(lead.phone_number, customer_text)
-            print("CUSTOMER SMS SID:", customer_msg.sid)
+        if config and config.send_customer_sms and business.booking_link:
+            # customer_msg = send_sms(lead.phone_number, customer_text)
+            # print("CUSTOMER SMS SID:", customer_msg.sid)
             mark_booking_link_sent(session, lead)
     except Exception as e:
         print("CUSTOMER SMS ERROR:", str(e))
 
     try:
-        if settings.twilio_phone_number and settings.owner_phone_number:
-            owner_msg = send_sms(settings.owner_phone_number, owner_text)
-            print("OWNER SMS SID:", owner_msg.sid)
+        if config and config.send_owner_sms and business.owner_phone:
+            # owner_msg = send_sms(business.owner_phone, owner_text)
+            # print("OWNER SMS SID:", owner_msg.sid)
             mark_owner_notified(session, lead)
     except Exception as e:
         print("OWNER SMS ERROR:", str(e))
 
-    CALL_STATE.pop(From, None)
+    CALL_STATE.pop(normalized_from, None)
+
+    completion_message = (
+        config.completion_message
+        if config and config.completion_message
+        else "Perfect, I’ve got everything I need. I’ll pass this along and they’ll take care of you. Talk soon."
+    )
 
     response = VoiceResponse()
-    response.say("Perfect, I’ve got everything I need. I’ll pass this to the shop and they’ll take care of you. Talk soon.")
+    response.say(completion_message)
     response.hangup()
     return Response(content=str(response), media_type="application/xml")

@@ -1,3 +1,5 @@
+"""AI + fallback parsing for extracting structured booking info from caller speech."""
+
 import json
 import re
 from openai import OpenAI
@@ -48,6 +50,7 @@ JSON schema:
 
 
 def fallback_response():
+    """Baseline response shape used when AI output is unavailable or invalid."""
     return {
         "intent": "booking",
         "assistant_reply": "Got you — what time were you thinking?",
@@ -60,6 +63,7 @@ def fallback_response():
 
 
 def clean_service(service):
+    """Normalize free-text service names into simple canonical labels."""
     if not service:
         return None
     s = service.lower().strip()
@@ -77,12 +81,14 @@ def clean_service(service):
 
 
 def clean_time(value):
+    """Normalize time text for easier downstream checks."""
     if not value:
         return None
     return value.replace(".", "").strip().lower()
 
 
 def clean_barber(value):
+    """Normalize barber preference; collapse flexible phrasing to 'no preference'."""
     if not value:
         return None
     v = value.strip().lower()
@@ -92,12 +98,14 @@ def clean_barber(value):
 
 
 def clean_name(value):
+    """Title-case and trim names for cleaner display/storage."""
     if not value:
         return None
     return value.strip().title()
 
 
 def fallback_extract_name(text: str):
+    """Regex fallback name extraction when model output is missing fields."""
     patterns = [
         r"my name is ([A-Za-z]+)",
         r"my name's ([A-Za-z]+)",
@@ -111,6 +119,7 @@ def fallback_extract_name(text: str):
 
 
 def fallback_extract_barber(text: str):
+    """Regex/phrase fallback for barber preference extraction."""
     lowered = text.lower()
     if (
         "anybody is fine" in lowered
@@ -123,6 +132,7 @@ def fallback_extract_barber(text: str):
 
 
 def fallback_extract_service(text: str):
+    """Keyword fallback for service extraction."""
     lowered = text.lower()
     if "fade" in lowered:
         return "fade"
@@ -136,6 +146,7 @@ def fallback_extract_service(text: str):
 
 
 def fallback_extract_time(text: str):
+    """Regex fallback for specific-ish time expressions."""
     match = re.search(
         r"(tomorrow(?:\s+(?:morning|afternoon|evening|night))?)|"
         r"(around\s+\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))|"
@@ -149,6 +160,7 @@ def fallback_extract_time(text: str):
 
 
 def extract_json(raw_text: str) -> dict | None:
+    """Parse JSON from raw model output, including fenced/mixed text fallback."""
     raw_text = raw_text.strip()
 
     try:
@@ -167,6 +179,7 @@ def extract_json(raw_text: str) -> dict | None:
 
 
 def analyze_customer_turn(user_text: str) -> dict:
+    """Call the model and return a cleaned structured booking state update."""
     try:
         response = client.responses.create(
             model=settings.openai_model,

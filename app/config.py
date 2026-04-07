@@ -1,11 +1,16 @@
+"""Application settings loaded from environment variables."""
+
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 
+# Load key/value pairs from .env into process environment.
 load_dotenv()
 
 
 class Settings(BaseModel):
+    """Typed container for app, database, and integration configuration."""
+
     app_name: str = os.getenv("APP_NAME", "Shaky Razor AI Receptionist")
     app_env: str = os.getenv("APP_ENV", "development")
     base_url: str = os.getenv("BASE_URL", "http://localhost:8000")
